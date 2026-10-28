@@ -11,6 +11,7 @@ Tools:
   auto_route    classify task with an LLM, then run it on that role's models
   ask           one prompt, explicit model or role, with fallback
   plan          parallel multi-job fanout, writes artifacts to disk
+  spawn_agents  a planner model chooses the agent count and each agent's task
   probe         health-check models with a 1-token ping
   health_check  cached pre-flight: which models answer right now, with TTL
   git_status    git repo state: branch, head, dirty files, worktrees
@@ -685,9 +686,8 @@ def ask(prompt: str, models: str = "reason", max_tokens: int = 4096,
     return json.dumps(res, indent=1, ensure_ascii=False)
 
 
-@mcp.tool()
-def plan(jobs_json: str, parallel: int = 4, preflight: bool = True,
-         repo: str = "", isolate: bool = False) -> str:
+def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
+               repo: str = "", isolate: bool = False) -> str:
     """Run a fanout plan in parallel. Each job writes its output to `out`.
 
     jobs_json: JSON list. Per job: id, role|model|models, prompt|prompt_file,
@@ -866,6 +866,154 @@ def plan(jobs_json: str, parallel: int = 4, preflight: bool = True,
 
 
 @mcp.tool()
+def plan(jobs_json: str, parallel: int = 4, preflight: bool = True,
+         repo: str = "", isolate: bool = False) -> str:
+    """Run a fanout plan in parallel. Each job writes its output to `out`.
+
+    jobs_json: JSON list. Per job: id, role|model|models, prompt|prompt_file,
+               optional files[], system, max_tokens, timeout, out, repo,
+               branch, isolate.
+    repo: default git repo for isolated jobs (a job's own `repo` wins).
+    isolate: give each job its own git worktree + branch, so parallel jobs
+             never overwrite each other's files. Requires git.
+    preflight: one health sweep over every model the plan touches.
+    A job that wrote 0 bytes counts as failed.
+
+    Use spawn_agents instead when the server should decide the split.
+    """
+    return _plan_impl(jobs_json, parallel=parallel, preflight=preflight,
+                      repo=repo, isolate=isolate)
+
+
+PLANNER_PROMPT = """You decompose a goal into parallel agent jobs.
+
+Return ONLY a JSON object, no prose, no markdown fences:
+{"agents":[{"id":"short-slug","role":"code|review|reason|design|research|fast",
+            "task":"precise self-contained instruction for that agent",
+            "out":"relative/path/to/artifact.ext"}]}
+
+Rules:
+- Between __MIN__ and __MAX__ agents. Use the FEWEST that does the job well:
+  every extra agent adds a merge conflict. One agent is a valid answer.
+- One agent per independent workstream that can run in parallel.
+- `task` must stand alone: the agent sees only that text, never the goal.
+- `out` is the file that agent writes, relative to its workspace. Give
+  different agents different paths. If two must edit one file, say so in the
+  task and expect a reported overlap.
+- `role` picks the model class: code writes programs, review audits existing
+  work, reason analyses/plans, design handles UI and copy, research finds
+  facts, fast handles trivial work.
+- Order agents so earlier ones produce what later ones consume.
+
+GOAL:
+__GOAL__"""
+
+
+def _extract_json(text):
+    """Pull the first JSON object out of a model reply."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\n```\s*$", "", t).strip()
+    start, end = t.find("{"), t.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(t[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+@mcp.tool()
+def spawn_agents(goal: str, max_agents: int = 5, min_agents: int = 1,
+                 repo: str = "", isolate: bool = True, parallel: int = 3,
+                 planner: str = "", max_tokens: int = 4096,
+                 timeout: int = 600, system: str = "",
+                 dry_run: bool = False) -> str:
+    """Let a planner model decide how many agents to run and what each one does.
+
+    goal: what must be accomplished, in plain language.
+    max_agents: hard cap on fan-out (clamped 1..12). The planner may use fewer.
+    min_agents: floor it should not go below (clamped 1..max_agents).
+    planner: model or role that writes the split (default: the `reason` role).
+    repo / isolate / parallel: same meaning as in plan(); each agent gets its
+        own git worktree and branch when isolate is on.
+    dry_run: return the decomposed jobs without spending an agent call.
+    """
+    if not goal or not goal.strip():
+        return json.dumps({"ok": False, "error": "goal is required"})
+    max_agents = max(1, min(int(max_agents or 1), 12))
+    min_agents = max(1, min(int(min_agents or 1), max_agents))
+
+    planner_models = resolve(planner or "reason")
+    planner_models, health = filter_alive(planner_models)
+    if not planner_models:
+        return json.dumps({"ok": False, "stage": "plan",
+                           "error": "no planner model available"})
+
+    prompt = (PLANNER_PROMPT.replace("__MIN__", str(min_agents))
+              .replace("__MAX__", str(max_agents))
+              .replace("__GOAL__", goal.strip()))
+    cls = run_with_fallback(planner_models, prompt, max_tokens=2000,
+                            timeout=min(timeout, 180), temperature=0,
+                            system=system or None)
+    if not cls.get("ok"):
+        return json.dumps({"ok": False, "stage": "plan",
+                           "error": cls.get("error"), "tried": cls.get("tried"),
+                           "health": health}, indent=1, ensure_ascii=False)
+
+    parsed = _extract_json(cls.get("text"))
+    if not parsed or not isinstance(parsed.get("agents"), list):
+        return json.dumps({"ok": False, "stage": "parse",
+                           "error": "planner did not return valid JSON",
+                           "raw": (cls.get("text") or "")[:2000],
+                           "planner": cls.get("model")},
+                          indent=1, ensure_ascii=False)
+
+    seen, jobs = set(), []
+    for i, a in enumerate(parsed["agents"][:max_agents]):
+        if not isinstance(a, dict):
+            continue
+        jid = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(a.get("id") or f"agent-{i + 1}"))
+        if jid in seen:
+            jid = f"{jid}-{i + 1}"
+        seen.add(jid)
+        role = a.get("role") if a.get("role") in ROLES else "code"
+        task = str(a.get("task") or "").strip()
+        if not task:
+            continue
+        job = {"id": jid, "role": role, "prompt": task,
+               "out": str(a.get("out") or f"{jid}.md"),
+               "max_tokens": max_tokens, "timeout": timeout,
+               "isolate": bool(isolate)}
+        if repo:
+            job["repo"] = repo
+        jobs.append(job)
+    if not jobs:
+        return json.dumps({"ok": False, "stage": "parse",
+                           "error": "planner returned no usable agents",
+                           "raw": (cls.get("text") or "")[:2000]},
+                          indent=1, ensure_ascii=False)
+
+    summary = [{"id": j["id"], "role": j["role"], "out": j["out"],
+                "task": j["prompt"][:400]} for j in jobs]
+    if dry_run:
+        return json.dumps({"ok": True, "dry_run": True, "agents": len(jobs),
+                           "requested": {"min": min_agents, "max": max_agents},
+                           "planner": cls.get("model"), "plan_health": health,
+                           "plan": summary}, indent=1, ensure_ascii=False)
+
+    res = json.loads(_plan_impl(json.dumps(jobs), parallel=parallel,
+                                preflight=True, repo=repo,
+                                isolate=bool(isolate)))
+    return json.dumps({"ok": res.get("ok", False), "agents": len(jobs),
+                       "requested": {"min": min_agents, "max": max_agents},
+                       "planner": cls.get("model"), "plan_health": health,
+                       "plan": summary, "failed": res.get("failed"),
+                       "secs": res.get("secs"), "isolation": res.get("isolation"),
+                       "overlaps": res.get("overlaps"),
+                       "results": res.get("results")},
+                      indent=1, ensure_ascii=False)@mcp.tool()
 def health_check(models: str = "", parallel: int = 8, timeout: int = 60,
                  force: bool = False) -> str:
     """Pre-flight: which models answer right now. Reported to the agent before any run.
