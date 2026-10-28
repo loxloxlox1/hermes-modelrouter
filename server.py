@@ -809,7 +809,8 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
                         "branch": job.get("_branch")}
         if worktree:
             prompt += (f"\n\n--- WORKSPACE ---\nEdit files inside {worktree}. "
-                       "Write every output file there. Do not touch other paths.")
+                       "Write every output file there. Do not touch other paths. "
+                       "Put the file content itself in the file -- no commentary.")
         r = run_with_fallback(targets, prompt,
                               max_tokens=job.get("max_tokens", 4096),
                               timeout=job.get("timeout", 600),
@@ -883,6 +884,15 @@ def plan(jobs_json: str, parallel: int = 4, preflight: bool = True,
     """
     return _plan_impl(jobs_json, parallel=parallel, preflight=preflight,
                       repo=repo, isolate=isolate)
+
+
+AGENT_DISCIPLINE = (
+    "You are one agent in a parallel build. Do the task and nothing else. "
+    "Write the real artifact to the output path: source code for .go/.py/.js, "
+    "prose only for .md. Never reply with narration, progress notes, or "
+    "explanations of what you are about to do -- the file content IS your "
+    "answer. No markdown fences around source files."
+)
 
 
 PLANNER_PROMPT = """You decompose a goal into parallel agent jobs.
@@ -985,7 +995,8 @@ def spawn_agents(goal: str, max_agents: int = 5, min_agents: int = 1,
         job = {"id": jid, "role": role, "prompt": task,
                "out": str(a.get("out") or f"{jid}.md"),
                "max_tokens": max_tokens, "timeout": timeout,
-               "isolate": bool(isolate)}
+               "isolate": bool(isolate),
+               "system": system or AGENT_DISCIPLINE}
         if repo:
             job["repo"] = repo
         jobs.append(job)
@@ -1013,7 +1024,10 @@ def spawn_agents(goal: str, max_agents: int = 5, min_agents: int = 1,
                        "secs": res.get("secs"), "isolation": res.get("isolation"),
                        "overlaps": res.get("overlaps"),
                        "results": res.get("results")},
-                      indent=1, ensure_ascii=False)@mcp.tool()
+                      indent=1, ensure_ascii=False)
+
+
+@mcp.tool()
 def health_check(models: str = "", parallel: int = 8, timeout: int = 60,
                  force: bool = False) -> str:
     """Pre-flight: which models answer right now. Reported to the agent before any run.
