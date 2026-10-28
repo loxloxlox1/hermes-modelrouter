@@ -72,6 +72,7 @@ Point it at any OpenAI-compatible endpoint with `AGENT_FANOUT_BASE`
 |---|---|
 | `ask(prompt, models, preflight)` | one prompt against a role, a model, or a fallback chain |
 | `plan(jobs_json, parallel, preflight, repo, isolate)` | parallel fan-out; each job writes its artifact to disk |
+| `spawn_agents(goal, max_agents, min_agents, repo, isolate, dry_run)` | a planner model decides the agent count and each agent's task, then runs them |
 | `health_check(models, force)` | cached pre-flight: alive / dead right now |
 | `probe(models)` | uncached ping sweep |
 
@@ -103,6 +104,29 @@ agent_merge(repo=PATH, branches="winner-a,winner-b", cleanup=true)
 
 `overlaps` exists so the orchestrator decides. Merging every branch blindly is
 how you get a file that no model intended to write.
+
+## Letting the planner pick the split
+
+`plan()` takes jobs you already wrote. `spawn_agents()` takes a goal and asks a
+planner model to do that part:
+
+```
+spawn_agents(goal="...", max_agents=5, min_agents=2, repo=PATH, isolate=true)
+  -> agents N                       how many the planner chose
+  -> plan[{id, role, out, task}]    the decomposition
+  -> results[] / overlaps[]         same shape as plan()
+```
+
+The planner sees only the goal and the bounds; it returns JSON. Its rules are in
+`PLANNER_PROMPT` and are load-bearing: use the fewest agents that does the job
+(every extra agent is a future merge conflict), one agent per independent
+workstream, each `task` self-contained, distinct `out` paths.
+
+`dry_run=True` returns the decomposition without spending an agent call — check
+the split before paying for it.
+
+Bounds are clamped: `max_agents` 1..12, `min_agents` 1..max_agents. A malformed
+planner reply comes back as `stage: "parse"` with the raw text, not a crash.
 
 ## Health model
 
