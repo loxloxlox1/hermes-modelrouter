@@ -5,9 +5,18 @@ import json
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SERVER = os.environ.get("MODELROUTER_SERVER") or os.path.join(
+    os.path.dirname(_HERE), "server.py")
+if not os.path.exists(_SERVER):
+    _SERVER = os.path.join(_HERE, "server.py")
+
 SERVER_CMD = "uv"
 SERVER_ARGS = ["run", "--with", "mcp", "python3",
-               "/home/ak1h/.hermes/mcp/modelrouter/server.py"]
+               _SERVER]
 
 
 async def main():

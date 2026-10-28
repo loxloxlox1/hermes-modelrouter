@@ -356,7 +356,7 @@ def health_snapshot(models, parallel=8, timeout=60, force=False):
             covered = set(_health["alive"]) | {d["model"] for d in _health["dead"]}
             if set(models) <= covered:
                 return _health, True
-    alive, dead = probe_models(models, parallel=parallel, timeout=timeout)
+    alive, dead, unknown = probe_models(models, parallel=parallel, timeout=timeout)
     with _health_lock:
         prev_alive = set(_health["alive"] or []) - set(models)
         prev_dead = [d for d in (_health["dead"] or []) if d["model"] not in models]
@@ -904,7 +904,7 @@ def probe(models: str = "", parallel: int = 8, timeout: int = 60) -> str:
     if not targets:
         return json.dumps({"ok": False, "error": "no models"})
 
-    alive, dead = probe_models(targets, parallel=parallel, timeout=timeout)
+    alive, dead, unknown = probe_models(targets, parallel=parallel, timeout=timeout)
     health = os.path.join(HOME, "agent-fanout", "health.json")
     os.makedirs(os.path.dirname(health), exist_ok=True)
     json.dump({"alive": alive, "dead": dead}, open(health, "w"), indent=1)
