@@ -11,7 +11,8 @@ Tools:
   auto_route    classify task with an LLM, then run it on that role's models
   ask           one prompt, explicit model or role, with fallback
   plan          parallel multi-job fanout, writes artifacts to disk
-  spawn_agents  a planner model chooses the agent count and each agent's task
+  spawn_agents  a planner model chooses the agent count and each agent's task;
+                a reviewer model then checks every artifact
   probe         health-check models with a 1-token ping
   health_check  cached pre-flight: which models answer right now, with TTL
   git_status    git repo state: branch, head, dirty files, worktrees
@@ -738,7 +739,8 @@ def ask(prompt: str, models: str = "reason", max_tokens: int = 4096,
 
 def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
                repo: str = "", isolate: bool = False, brief: str = "",
-               race: int = 2) -> str:
+               race: int = 2, review: bool = True, reviewer: str = "",
+               review_rounds: int = 1) -> str:
     """Run a fanout plan. Each job writes its output to `out`.
 
     jobs_json: JSON list. Per job: id, role|model|models, prompt|prompt_file,
@@ -758,6 +760,11 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
     verify: shell command run in the job's workspace after it writes. Non-zero
         exit feeds the output back to the model and retries, up to max_retries
         (default 2).
+    review: after a job passes verify, a separate reviewer model reads the
+        artifact and either accepts it or lists blocking defects; a rejected
+        job is re-run with those defects in its prompt, up to review_rounds
+        times (default 1). Per-job `review: false` opts out; per-job
+        `reviewer` picks the model or role.
     preflight: one health sweep over every model the plan touches.
     A job that wrote 0 bytes counts as failed.
     """
@@ -808,12 +815,16 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
                           indent=1, ensure_ascii=False)
 
     report = {"checked": False}
+    reviewer_pool = []
+    if review:
+        reviewer_pool = resolve(reviewer or "review") or resolve("reason")
     if preflight:
         all_models = []
         for j in jobs:
             ms = (j.get("models") or ([j["model"]] if j.get("model")
                   else resolve(j.get("role", "reason"))))
             all_models += [m for m in ms if m not in all_models]
+        all_models += [m for m in reviewer_pool if m not in all_models]
         if all_models:
             report = filter_alive(all_models)[1]
 
@@ -964,6 +975,45 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
         return {"ok": p.returncode == 0, "cmd": cmd, "exit_code": p.returncode,
                 "output": out[-3000:]}
 
+    ART_REVIEW_CAP = 14000
+
+    def _review(job, worktree, out_path, text, task, pool):
+        """One reviewer pass: {ok, blocking, notes, model, skipped}."""
+        body = text or ""
+        if out_path and os.path.isfile(out_path):
+            body = _read(out_path) or body
+        if not body.strip():
+            return {"ok": False, "model": None, "skipped": False,
+                    "blocking": ["artifact is empty"], "notes": "nothing to review"}
+        pool = [m for m in (pool or [])]
+        writer = job.get("model") or ""
+        others = [m for m in pool if m != writer]
+        if others:
+            pool = others
+        if not pool:
+            return {"ok": True, "model": None, "skipped": True, "blocking": [],
+                    "notes": "no reviewer model available"}
+        prompt = (REVIEWER_PROMPT
+                  .replace("__PATH__", job.get("out") or "inline")
+                  .replace("__TASK__", (task or "")[:4000])
+                  .replace("__ARTIFACT__", body[:ART_REVIEW_CAP]))
+        r = run_with_fallback(pool, prompt, max_tokens=1200,
+                              timeout=min(int(job.get("timeout", 600)), 300),
+                              temperature=0, race=1)
+        if not r.get("ok"):
+            return {"ok": True, "model": r.get("model"), "skipped": True,
+                    "blocking": [], "notes": "reviewer unreachable: %s" % r.get("error")}
+        parsed = _extract_json(r.get("text"))
+        if not isinstance(parsed, dict) or "ok" not in parsed:
+            return {"ok": True, "model": r.get("model"), "skipped": True,
+                    "blocking": [], "raw": (r.get("text") or "")[:800],
+                    "notes": "reviewer did not return JSON; treated as accept"}
+        blocking = [str(x) for x in (parsed.get("blocking") or []) if str(x).strip()]
+        return {"ok": bool(parsed.get("ok")) and not blocking,
+                "model": r.get("model"), "skipped": False,
+                "blocking": blocking,
+                "notes": str(parsed.get("notes") or "")[:2000]}
+
     def run(pair):
         job, worktree = pair[0], pair[1]
         jid = job.get("id", "?")
@@ -997,15 +1047,21 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
             system = (system + "\n\n--- PROJECT BRIEF ---\n" + brief
                       if system.strip() else brief)
         prompt = base + extra + _ancestor_block(job) + note
+        want_review = bool(job.get("review", review)) and bool(reviewer_pool)
+        rounds = max(0, min(int(job.get("review_rounds", review_rounds) or 0), 3))
+        my_pool = resolve(job["reviewer"]) if job.get("reviewer") else reviewer_pool
         retries = int(job.get("max_retries", 2)) if job.get("verify") else 0
+        total = max(retries, 0) + (rounds if want_review else 0) + 1
         rec = {"id": jid, "role": job.get("role", ""), "ok": False,
                "model": None, "secs": None, "error": None, "tried": None,
-               "_text": ""}
+               "_text": "", "reviews": []}
         ver = {"ok": True, "skipped": True}
+        rev = {"ok": True, "skipped": True}
         attempts = 0
-        for attempt in range(max(retries, 0) + 1):
-            attempts = attempt + 1
-            r = run_with_fallback(targets, prompt,
+        feedback = ""
+        while attempts < total:
+            attempts += 1
+            r = run_with_fallback(targets, prompt + feedback,
                                   max_tokens=job.get("max_tokens", 4096),
                                   timeout=job.get("timeout", 600),
                                   system=system or None, race=race)
@@ -1033,20 +1089,38 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
             else:
                 rec["text"] = text
             ver = _verify(job, worktree, job.get("_repo") or repo or "")
-            if ver.get("ok"):
+            if not ver.get("ok"):
+                rec["error"] = "verify failed: %s" % ver.get("cmd")
+                feedback = (
+                    "\n\n--- VERIFY FAILED (attempt %d/%d) ---\n"
+                    "command: %s\nexit: %s\noutput:\n%s\n\n"
+                    "Rewrite the file so this command passes."
+                    % (attempts, total, ver.get("cmd"), ver.get("exit_code"),
+                       (ver.get("output") or "")[-2000:]))
+                continue
+            if not want_review:
                 rec["ok"] = True
                 rec["error"] = None
                 rec["_text"] = text
                 break
-            rec["error"] = "verify failed: %s" % ver.get("cmd")
-            if attempt < max(retries, 0):
-                prompt = (base + extra + _ancestor_block(job) + note +
-                          "\n\n--- VERIFY FAILED (attempt %d/%d) ---\n"
-                          "command: %s\nexit: %s\noutput:\n%s\n\n"
-                          "Rewrite the file so this command passes."
-                          % (attempt + 1, retries + 1, ver.get("cmd"),
-                             ver.get("exit_code"), (ver.get("output") or "")[-2000:]))
+            rounds = max(0, rounds - 1)
+            rev = _review(job, worktree, rec.get("out"), text, base, my_pool)
+            rec["reviews"].append(rev)
+            if rev.get("ok"):
+                rec["ok"] = True
+                rec["error"] = None
+                rec["_text"] = text
+                break
+            blockers = rev.get("blocking") or []
+            rec["error"] = "review rejected: %s" % ("; ".join(blockers) or "no detail")
+            feedback = ("\n\n--- REJECTED BY REVIEWER (attempt %d/%d) ---\n"
+                        "Your artifact was rejected. Blocking defects:\n%s\n\n%s\n\n"
+                        "Rewrite the file so none of these remain."
+                        % (attempts, total,
+                           "\n".join("- " + b for b in blockers),
+                           rev.get("notes") or ""))
         rec["verify"] = ver
+        rec["review"] = rev
         rec["attempts"] = attempts
         if worktree:
             rec["worktree"] = worktree
@@ -1117,15 +1191,47 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
 @mcp.tool()
 def plan(jobs_json: str, parallel: int = 4, preflight: bool = True,
          repo: str = "", isolate: bool = False, brief: str = "",
-         race: int = 2) -> str:
+         race: int = 2, review: bool = True, reviewer: str = "",
+         review_rounds: int = 1) -> str:
     """Run a fanout plan. Each job writes its output to `out`.
 
     Jobs may declare depends_on (run in waves, ancestors' artifacts are passed
     down), verify (shell command that must exit 0, failures retried), and share
-    a `brief` prepended to every system prompt. See _plan_impl for details.
+    a `brief` prepended to every system prompt. After a job finishes, a
+    separate reviewer model reads the artifact; a rejected job is re-run with
+    the reviewer's blocking defects in its prompt. See _plan_impl.
     """
     return _plan_impl(jobs_json, parallel=parallel, preflight=preflight,
-                      repo=repo, isolate=isolate, brief=brief, race=race)
+                      repo=repo, isolate=isolate, brief=brief, race=race,
+                      review=review, reviewer=reviewer,
+                      review_rounds=review_rounds)
+
+
+REVIEWER_PROMPT = """You review ONE artifact written by another agent.
+
+You do not rewrite it and you do not praise it. Read the task, read the
+artifact, decide whether the task is actually done.
+
+Return ONLY a JSON object, no prose, no fences:
+{"ok": true|false,
+ "blocking": ["one line per concrete defect that must be fixed"],
+ "notes": "one short paragraph, only when ok is false"}
+
+Set ok=false ONLY for defects that make the artifact wrong or unusable:
+syntax or type errors, imports that do not resolve, a function the task
+required but is missing, wrong output path or file name, prose where code was
+required, a test that does not test what it claims, an API the task specified
+implemented with a different name or signature.
+
+Do not set ok=false for style, naming taste, missing comments, missing
+optional features, or "could be nicer". If it works and matches the task, ok
+is true. An empty or unreadable artifact is blocking.
+
+--- TASK GIVEN TO THE AGENT ---
+__TASK__
+
+--- ARTIFACT (__PATH__) ---
+__ARTIFACT__"""
 
 
 AGENT_DISCIPLINE = (
@@ -1144,7 +1250,8 @@ Return ONLY a JSON object, no prose, no markdown fences:
             "task":"precise self-contained instruction for that agent",
             "out":"relative/path/to/artifact.ext",
             "depends_on":["id-of-an-earlier-agent"],
-            "verify":"shell command that must exit 0 in that agent's workspace"}]}
+            "verify":"shell command that must exit 0 in that agent's workspace",
+            "review":true}]}
 
 Rules:
 - Between __MIN__ and __MAX__ agents. Use the FEWEST that does the job well:
@@ -1164,6 +1271,10 @@ Rules:
   workspace after it writes, for example "go build ./..." or
   "python3 -m pytest -q". On failure the agent sees the output and retries.
   Add one whenever the artifact is mechanically checkable.
+- `review` defaults to true: a different model reads the artifact and rejects
+  it when the task is not actually done, sending the defects back to the agent.
+  Set it false only for artifacts nothing can meaningfully check (raw research
+  notes).
 
 GOAL:
 __GOAL__"""
@@ -1189,7 +1300,9 @@ def spawn_agents(goal: str, max_agents: int = 5, min_agents: int = 1,
                  repo: str = "", isolate: bool = True, parallel: int = 3,
                  planner: str = "", max_tokens: int = 4096,
                  timeout: int = 600, system: str = "",
-                 dry_run: bool = False, brief: str = "") -> str:
+                 dry_run: bool = False, brief: str = "",
+                 review: bool = True, reviewer: str = "",
+                 review_rounds: int = 1) -> str:
     """Let a planner model decide how many agents to run and what each one does.
 
     goal: what must be accomplished, in plain language.
@@ -1199,6 +1312,10 @@ def spawn_agents(goal: str, max_agents: int = 5, min_agents: int = 1,
     repo / isolate / parallel: same meaning as in plan(); each agent gets its
         own git worktree and branch when isolate is on.
     dry_run: return the decomposed jobs without spending an agent call.
+    review / reviewer / review_rounds: after each agent writes, a separate
+        reviewer model checks its artifact; a rejected agent redoes the work
+        with the reviewer's blocking defects attached. review=false turns the
+        check off for the whole run.
     """
     if not goal or not goal.strip():
         return json.dumps({"ok": False, "error": "goal is required"})
@@ -1247,7 +1364,11 @@ def spawn_agents(goal: str, max_agents: int = 5, min_agents: int = 1,
                "max_tokens": max_tokens, "timeout": timeout,
                "isolate": bool(isolate),
                "depends_on": [str(x) for x in (a.get("depends_on") or [])],
-               "system": system or AGENT_DISCIPLINE}
+               "system": system or AGENT_DISCIPLINE,
+               "review": bool(a.get("review", True)) and bool(review),
+               "review_rounds": review_rounds}
+        if reviewer:
+            job["reviewer"] = reviewer
         if a.get("verify"):
             job["verify"] = str(a["verify"])
         if repo:
@@ -1282,7 +1403,9 @@ def spawn_agents(goal: str, max_agents: int = 5, min_agents: int = 1,
 
     res = json.loads(_plan_impl(json.dumps(jobs), parallel=parallel,
                                 preflight=True, repo=repo,
-                                isolate=bool(isolate), brief=brief))
+                                isolate=bool(isolate), brief=brief,
+                                review=review, reviewer=reviewer,
+                                review_rounds=review_rounds))
     return json.dumps({"ok": res.get("ok", False), "agents": len(jobs),
                        "requested": {"min": min_agents, "max": max_agents},
                        "planner": cls.get("model"), "plan_health": health,
