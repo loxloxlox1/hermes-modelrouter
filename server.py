@@ -48,7 +48,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -257,19 +257,51 @@ def resolve(role_or_models):
     return [s]
 
 
-def run_with_fallback(models, prompt, **kw):
-    last, tried = None, []
-    for m in models:
+def run_with_fallback(models, prompt, race=1, **kw):
+    """Try each model until one returns non-empty text.
+
+    race: how many candidates to launch at once. A dead model otherwise costs a
+    full timeout before the next one is tried. First non-empty answer wins.
+    """
+    models = [m for m in models if m]
+    tried = []
+
+    def attempt(m):
         r = chat(m, prompt, **kw)
-        tried.append({"model": m, "ok": r["ok"], "error": r.get("error")})
+        if r.get("ok") and not (r.get("text") or "").strip():
+            r = dict(r, ok=False, error="empty body (HTTP 200)")
+        return r
+
+    n = max(1, min(int(race or 1), len(models) or 1))
+    if n > 1 and len(models) > 1:
+        head, rest = models[:n], models[n:]
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            futs = {ex.submit(attempt, m): m for m in head}
+            for fut in as_completed(futs):
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    r = {"ok": False, "model": futs[fut],
+                         "error": "%s: %s" % (type(e).__name__, e)}
+                tried.append({"model": r.get("model"), "ok": r.get("ok", False),
+                              "error": r.get("error")})
+                if r.get("ok"):
+                    r["tried"] = tried
+                    for f in futs:
+                        f.cancel()
+                    return r
+        models = rest
+    last = None
+    for m in models:
+        r = attempt(m)
+        tried.append({"model": m, "ok": r.get("ok", False), "error": r.get("error")})
         last = r
-        if r["ok"] and r["text"].strip():
+        if r.get("ok"):
             r["tried"] = tried
             return r
-        if r["ok"] and not r["text"].strip():
-            last = {**r, "ok": False, "error": "empty body (HTTP 200)"}
     if last is None:
         return {"ok": False, "error": "no models to try", "tried": tried}
+    last = dict(last)
     last["tried"] = tried
     return last
 
@@ -687,22 +719,28 @@ def ask(prompt: str, models: str = "reason", max_tokens: int = 4096,
 
 
 def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
-               repo: str = "", isolate: bool = False) -> str:
-    """Run a fanout plan in parallel. Each job writes its output to `out`.
+               repo: str = "", isolate: bool = False, brief: str = "",
+               race: int = 2) -> str:
+    """Run a fanout plan. Each job writes its output to `out`.
 
     jobs_json: JSON list. Per job: id, role|model|models, prompt|prompt_file,
                optional files[], system, max_tokens, timeout, out, repo,
-               branch, isolate.
+               branch, isolate, depends_on[], verify, max_retries.
     repo: default git repo for isolated jobs (a job's own `repo` wins).
     isolate: give each job its own git worktree + branch, so parallel jobs
-             never overwrite each other's files. Requires git. Per-job
-             `isolate: false` opts out; `isolate: true` opts in.
-             Relative `files`/`prompt_file`/`out` resolve inside the worktree.
-             Each job is committed on its branch; the reply lists the changed
-             files per branch and every file touched by more than one branch
-             under "overlaps" so the main model decides what wins.
-    preflight: one health sweep over every model the plan touches, before any
-               job starts; the report comes back in "health".
+             never overwrite each other's files. Requires git.
+    brief: shared text appended to every job's system prompt -- stack, naming,
+           API contract. Parallel-safe, no dependencies, covers most of what a
+           shared transcript would and costs one copy per prompt.
+    race: how many candidate models to launch at once per job.
+    depends_on: ids that must finish first. Jobs run in waves; a job starts
+        only after its ancestors are done, their artifacts are copied into its
+        worktree and pasted into its prompt. Jobs without depends_on form the
+        first wave and run in parallel.
+    verify: shell command run in the job's workspace after it writes. Non-zero
+        exit feeds the output back to the model and retries, up to max_retries
+        (default 2).
+    preflight: one health sweep over every model the plan touches.
     A job that wrote 0 bytes counts as failed.
     """
     try:
@@ -713,6 +751,43 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
         jobs = jobs.get("jobs", [])
     if not isinstance(jobs, list) or not jobs:
         return json.dumps({"ok": False, "error": "jobs must be a non-empty list"})
+
+    ids, seen_ids = [], set()
+    for i, job in enumerate(jobs):
+        jid = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(job.get("id") or f"job-{i + 1}"))
+        base, n = jid, 2
+        while jid in seen_ids:
+            jid = f"{base}-{n}"
+            n += 1
+        seen_ids.add(jid)
+        ids.append(jid)
+        if job.get("id") != jid:
+            jobs[i] = dict(job, id=jid)
+
+    known = set(ids)
+    bad_deps = []
+    for jid, job in zip(ids, jobs):
+        for d in job.get("depends_on") or []:
+            if str(d) not in known:
+                bad_deps.append({"job": jid, "depends_on": str(d)})
+    if bad_deps:
+        return json.dumps({"ok": False,
+                           "error": "depends_on refers to an unknown job id",
+                           "unknown": bad_deps, "known": ids},
+                          indent=1, ensure_ascii=False)
+
+    outs = {}
+    for jid, job in zip(ids, jobs):
+        o = str(job.get("out") or "")
+        if o:
+            outs.setdefault(o, []).append(jid)
+    out_conflicts = [{"out": k, "jobs": v} for k, v in outs.items() if len(v) > 1]
+    if out_conflicts and not isolate:
+        return json.dumps({"ok": False,
+                           "error": "two jobs write the same out path; give "
+                                    "distinct paths or turn on isolate",
+                           "out_conflicts": out_conflicts},
+                          indent=1, ensure_ascii=False)
 
     report = {"checked": False}
     if preflight:
@@ -765,7 +840,7 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
                 "initial_commit": init.get("initial_commit", False)}
             for job in group:
                 idx = next(i for i, j in enumerate(jobs) if j is job)
-                jid = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(job.get("id", "?")))
+                jid = job["id"]
                 branch = str(job.get("branch") or f"mr/{run_id}/{jid}")
                 wt = os.path.join(SCRATCH, "modelrouter-wt", run_id, jid)
                 made = git_worktree_add(init["repo"], wt, branch, init["head"])
@@ -786,50 +861,158 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
         if idx not in used:
             prepared.append((job, None, idx))
 
+    ART_CAP = 6000
+    CTX_CAP = 18000
+    ctx = {}
+
+    def _read(path):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            return None
+
+    def _ancestor_block(job):
+        parts, total = [], 0
+        for d in (job.get("depends_on") or []):
+            rec = ctx.get(str(d)) or {}
+            body = _read(rec["out"]) if rec.get("out") else None
+            if body is None:
+                body = rec.get("text") or ""
+            if not body.strip():
+                continue
+            body = body[:ART_CAP]
+            parts.append("\n\n--- ARTIFACT FROM %s (%s) ---\n%s"
+                         % (d, rec.get("out") or "inline", body))
+            total += len(body)
+            if total >= CTX_CAP:
+                break
+        if not parts:
+            return ""
+        return ("\n\n--- ANCESTOR OUTPUT ---\nThese files were produced by the "
+                "jobs you depend on. Match their API and names exactly."
+                + "".join(parts))
+
+    def _seed_worktree(job, worktree):
+        """Copy ancestors' artifacts into a dependent job's worktree."""
+        if not worktree:
+            return
+        for d in (job.get("depends_on") or []):
+            rec = ctx.get(str(d)) or {}
+            src = rec.get("out")
+            if not src or not os.path.isfile(src):
+                continue
+            root = rec.get("repo") or ""
+            rel = os.path.basename(src)
+            if root and src.startswith(root + os.sep):
+                rel = os.path.relpath(src, root)
+            dst = os.path.join(worktree, rel)
+            try:
+                os.makedirs(os.path.dirname(dst) or worktree, exist_ok=True)
+                shutil.copyfile(src, dst)
+            except OSError:
+                pass
+
+    def _verify(job, worktree, fallback_dir):
+        cmd = str(job.get("verify") or "").strip()
+        if not cmd:
+            return {"ok": True, "skipped": True}
+        cwd = worktree or fallback_dir or os.getcwd()
+        limit = int(job.get("verify_timeout", 300))
+        try:
+            p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True,
+                               text=True, timeout=limit)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "cmd": cmd, "error": f"timeout after {limit}s"}
+        except OSError as e:
+            return {"ok": False, "cmd": cmd, "error": f"could not run: {e}"}
+        out = ((p.stdout or "") + (p.stderr or "")).strip()
+        return {"ok": p.returncode == 0, "cmd": cmd, "exit_code": p.returncode,
+                "output": out[-3000:]}
+
     def run(pair):
         job, worktree = pair[0], pair[1]
         jid = job.get("id", "?")
         targets = (job.get("models") or ([job["model"]] if job.get("model")
                    else resolve(job.get("role", "reason"))))
-        prompt = job.get("prompt", "")
+        base = job.get("prompt", "")
         if job.get("prompt_file"):
             try:
-                prompt = open(_resolve_in(worktree, job["prompt_file"]),
-                              encoding="utf-8").read()
+                base = open(_resolve_in(worktree, job["prompt_file"]),
+                            encoding="utf-8").read()
             except OSError as e:
                 return {"id": jid, "ok": False, "error": f"prompt_file: {e}",
                         "branch": job.get("_branch")}
+        extra = ""
         for f in job.get("files") or []:
             fp = _resolve_in(worktree, f)
             try:
-                prompt += f"\n\n--- FILE: {fp} ---\n" + open(fp, encoding="utf-8",
-                                                          errors="replace").read()
+                extra += ("\n\n--- FILE: %s ---\n" % fp) + open(
+                    fp, encoding="utf-8", errors="replace").read()
             except OSError as e:
                 return {"id": jid, "ok": False, "error": f"file {f}: {e}",
                         "branch": job.get("_branch")}
+        note = ""
         if worktree:
-            prompt += (f"\n\n--- WORKSPACE ---\nEdit files inside {worktree}. "
-                       "Write every output file there. Do not touch other paths. "
-                       "Put the file content itself in the file -- no commentary.")
-        r = run_with_fallback(targets, prompt,
-                              max_tokens=job.get("max_tokens", 4096),
-                              timeout=job.get("timeout", 600),
-                              system=job.get("system"))
-        rec = {"id": jid, "role": job.get("role", ""), "ok": r.get("ok", False),
-               "model": r.get("model"), "secs": r.get("secs"),
-               "error": r.get("error"), "tried": r.get("tried")}
-        if r.get("ok"):
-            out = _resolve_in(worktree, job.get("out"))
-            rec["chars"] = len(r["text"])
-            if not r["text"].strip():
-                rec["ok"] = False
+            note = (f"\n\n--- WORKSPACE ---\nEdit files inside {worktree}. "
+                    "Write every output file there. Do not touch other paths. "
+                    "Put the file content itself in the file -- no commentary.")
+        system = job.get("system") or ""
+        if brief:
+            system = (system + "\n\n--- PROJECT BRIEF ---\n" + brief
+                      if system.strip() else brief)
+        prompt = base + extra + _ancestor_block(job) + note
+        retries = int(job.get("max_retries", 2)) if job.get("verify") else 0
+        rec = {"id": jid, "role": job.get("role", ""), "ok": False,
+               "model": None, "secs": None, "error": None, "tried": None,
+               "_text": ""}
+        ver = {"ok": True, "skipped": True}
+        attempts = 0
+        for attempt in range(max(retries, 0) + 1):
+            attempts = attempt + 1
+            r = run_with_fallback(targets, prompt,
+                                  max_tokens=job.get("max_tokens", 4096),
+                                  timeout=job.get("timeout", 600),
+                                  system=system or None, race=race)
+            rec.update({"model": r.get("model"), "secs": r.get("secs"),
+                        "tried": r.get("tried")})
+            if not r.get("ok"):
+                rec["error"] = r.get("error")
+                break
+            text = r.get("text") or ""
+            rec["chars"] = len(text)
+            rec["_text"] = text
+            if not text.strip():
                 rec["error"] = "empty body"
-            elif out:
-                os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
-                open(out, "w", encoding="utf-8").write(r["text"])
-                rec["out"] = out
+                break
+            out = _resolve_in(worktree, job.get("out"))
+            if out:
+                try:
+                    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".",
+                                exist_ok=True)
+                    with open(out, "w", encoding="utf-8") as fh:
+                        fh.write(text)
+                    rec["out"] = out
+                except OSError as e:
+                    rec["error"] = f"write {out}: {e}"
+                    break
             else:
-                rec["text"] = r["text"]
+                rec["text"] = text
+            ver = _verify(job, worktree, job.get("_repo") or repo or "")
+            if ver.get("ok"):
+                rec["ok"] = True
+                rec["error"] = None
+                break
+            rec["error"] = "verify failed: %s" % ver.get("cmd")
+            if attempt < max(retries, 0):
+                prompt = (base + extra + _ancestor_block(job) + note +
+                          "\n\n--- VERIFY FAILED (attempt %d/%d) ---\n"
+                          "command: %s\nexit: %s\noutput:\n%s\n\n"
+                          "Rewrite the file so this command passes."
+                          % (attempt + 1, retries + 1, ver.get("cmd"),
+                             ver.get("exit_code"), (ver.get("output") or "")[-2000:]))
+        rec["verify"] = ver
+        rec["attempts"] = attempts
         if worktree:
             rec["worktree"] = worktree
             rec["branch"] = job.get("_branch")
@@ -837,53 +1020,75 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
             rec["commit"] = commit
             if commit.get("ok"):
                 rec["files_changed"] = commit.get("files", [])
-            else:
+            elif rec["ok"]:
                 rec["ok"] = False
-                rec["error"] = rec.get("error") or commit.get("error")
+                rec["error"] = commit.get("error")
         return rec
 
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
-        results = list(ex.map(run, prepared))
+    results = []
+    pending = {job["id"]: (job, wt) for job, wt, _i in prepared}
+    while pending:
+        ready = []
+        for jid, (job, _wt) in pending.items():
+            deps = [str(d) for d in (job.get("depends_on") or [])]
+            if all(d in ctx for d in deps):
+                ready.append(jid)
+        if not ready:
+            for jid in list(pending):
+                results.append({"id": jid, "ok": False,
+                                "error": "unresolvable depends_on (cycle)"})
+                pending.pop(jid)
+            break
+        wave = []
+        for jid in ready:
+            job, wt = pending.pop(jid)
+            _seed_worktree(job, wt)
+            wave.append((job, wt))
+        with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
+            wres = list(ex.map(run, wave))
+        for rec in wres:
+            text = rec.pop("_text", "")
+            job_repo = next((p[0].get("_repo") or "" for p in prepared
+                             if p[0]["id"] == rec["id"]), "")
+            ctx[rec["id"]] = {"out": rec.get("out"), "text": text,
+                              "repo": job_repo}
+            results.append(rec)
+
+    order = {jid: i for i, jid in enumerate(ids)}
+    results.sort(key=lambda r: order.get(r["id"], len(order)))
 
     overlaps = []
     touched = {}
     for r in results:
         for f in r.get("files_changed") or []:
             touched.setdefault(f, []).append(r["id"])
-    for f, ids in touched.items():
-        if len(ids) > 1:
-            overlaps.append({"file": f, "jobs": ids})
+    for f, jids in touched.items():
+        if len(jids) > 1:
+            overlaps.append({"file": f, "jobs": jids})
     if isolation["enabled"]:
         isolation["merge_hint"] = ("pick winners, then call agent_merge("
-                                  "repo=PATH, branches='a,b')")
+                                   "repo=PATH, branches='a,b')")
     failed = [r["id"] for r in results if not r["ok"]]
     return json.dumps({"ok": not failed, "jobs": len(results),
                        "failed": failed, "secs": round(time.time() - t0, 1),
                        "health": report, "isolation": isolation,
-                       "overlaps": overlaps,
+                       "overlaps": overlaps, "out_conflicts": out_conflicts,
                        "results": results},
                       indent=1, ensure_ascii=False)
 
-
 @mcp.tool()
 def plan(jobs_json: str, parallel: int = 4, preflight: bool = True,
-         repo: str = "", isolate: bool = False) -> str:
-    """Run a fanout plan in parallel. Each job writes its output to `out`.
+         repo: str = "", isolate: bool = False, brief: str = "",
+         race: int = 2) -> str:
+    """Run a fanout plan. Each job writes its output to `out`.
 
-    jobs_json: JSON list. Per job: id, role|model|models, prompt|prompt_file,
-               optional files[], system, max_tokens, timeout, out, repo,
-               branch, isolate.
-    repo: default git repo for isolated jobs (a job's own `repo` wins).
-    isolate: give each job its own git worktree + branch, so parallel jobs
-             never overwrite each other's files. Requires git.
-    preflight: one health sweep over every model the plan touches.
-    A job that wrote 0 bytes counts as failed.
-
-    Use spawn_agents instead when the server should decide the split.
+    Jobs may declare depends_on (run in waves, ancestors' artifacts are passed
+    down), verify (shell command that must exit 0, failures retried), and share
+    a `brief` prepended to every system prompt. See _plan_impl for details.
     """
     return _plan_impl(jobs_json, parallel=parallel, preflight=preflight,
-                      repo=repo, isolate=isolate)
+                      repo=repo, isolate=isolate, brief=brief, race=race)
 
 
 AGENT_DISCIPLINE = (
@@ -900,7 +1105,9 @@ PLANNER_PROMPT = """You decompose a goal into parallel agent jobs.
 Return ONLY a JSON object, no prose, no markdown fences:
 {"agents":[{"id":"short-slug","role":"code|review|reason|design|research|fast",
             "task":"precise self-contained instruction for that agent",
-            "out":"relative/path/to/artifact.ext"}]}
+            "out":"relative/path/to/artifact.ext",
+            "depends_on":["id-of-an-earlier-agent"],
+            "verify":"shell command that must exit 0 in that agent's workspace"}]}
 
 Rules:
 - Between __MIN__ and __MAX__ agents. Use the FEWEST that does the job well:
@@ -913,7 +1120,13 @@ Rules:
 - `role` picks the model class: code writes programs, review audits existing
   work, reason analyses/plans, design handles UI and copy, research finds
   facts, fast handles trivial work.
-- Order agents so earlier ones produce what later ones consume.
+- `depends_on` is the only thing that creates ordering. List the ids whose
+  artifacts this agent consumes; it starts after they finish and its prompt
+  contains their files. Do not describe a dependency in prose -- declare it.
+- `verify` is optional but valuable: a shell command run in that agent's
+  workspace after it writes, for example "go build ./..." or
+  "python3 -m pytest -q". On failure the agent sees the output and retries.
+  Add one whenever the artifact is mechanically checkable.
 
 GOAL:
 __GOAL__"""
@@ -939,7 +1152,7 @@ def spawn_agents(goal: str, max_agents: int = 5, min_agents: int = 1,
                  repo: str = "", isolate: bool = True, parallel: int = 3,
                  planner: str = "", max_tokens: int = 4096,
                  timeout: int = 600, system: str = "",
-                 dry_run: bool = False) -> str:
+                 dry_run: bool = False, brief: str = "") -> str:
     """Let a planner model decide how many agents to run and what each one does.
 
     goal: what must be accomplished, in plain language.
@@ -996,7 +1209,10 @@ def spawn_agents(goal: str, max_agents: int = 5, min_agents: int = 1,
                "out": str(a.get("out") or f"{jid}.md"),
                "max_tokens": max_tokens, "timeout": timeout,
                "isolate": bool(isolate),
+               "depends_on": [str(x) for x in (a.get("depends_on") or [])],
                "system": system or AGENT_DISCIPLINE}
+        if a.get("verify"):
+            job["verify"] = str(a["verify"])
         if repo:
             job["repo"] = repo
         jobs.append(job)
@@ -1005,6 +1221,19 @@ def spawn_agents(goal: str, max_agents: int = 5, min_agents: int = 1,
                            "error": "planner returned no usable agents",
                            "raw": (cls.get("text") or "")[:2000]},
                           indent=1, ensure_ascii=False)
+
+    # Two agents writing one path silently overwrite each other. Make the
+    # planner's paths unique before spending a single model call.
+    seen_out = set()
+    for job in jobs:
+        o = job.get("out") or ""
+        if o in seen_out:
+            root, ext = os.path.splitext(o)
+            n = 2
+            while "%s-%d%s" % (root, n, ext) in seen_out:
+                n += 1
+            job["out"] = "%s-%d%s" % (root, n, ext)
+        seen_out.add(job["out"])
 
     summary = [{"id": j["id"], "role": j["role"], "out": j["out"],
                 "task": j["prompt"][:400]} for j in jobs]
@@ -1016,7 +1245,7 @@ def spawn_agents(goal: str, max_agents: int = 5, min_agents: int = 1,
 
     res = json.loads(_plan_impl(json.dumps(jobs), parallel=parallel,
                                 preflight=True, repo=repo,
-                                isolate=bool(isolate)))
+                                isolate=bool(isolate), brief=brief))
     return json.dumps({"ok": res.get("ok", False), "agents": len(jobs),
                        "requested": {"min": min_agents, "max": max_agents},
                        "planner": cls.get("model"), "plan_health": health,
@@ -1069,8 +1298,12 @@ def probe(models: str = "", parallel: int = 8, timeout: int = 60) -> str:
     alive, dead, unknown = probe_models(targets, parallel=parallel, timeout=timeout)
     health = os.path.join(HOME, "agent-fanout", "health.json")
     os.makedirs(os.path.dirname(health), exist_ok=True)
-    json.dump({"alive": alive, "dead": dead}, open(health, "w"), indent=1)
-    return json.dumps({"alive": alive, "dead": dead, "health_file": health},
+    json.dump({"alive": alive, "dead": dead,
+               "unknown": [u["model"] for u in unknown]},
+              open(health, "w"), indent=1)
+    return json.dumps({"alive": alive, "dead": dead,
+                       "unknown": [u["model"] for u in unknown],
+                       "health_file": health},
                       indent=1, ensure_ascii=False)
 
 
