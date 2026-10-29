@@ -82,10 +82,14 @@ def key_env_from_url(base):
         u = urllib.parse.urlparse(base)
     except ValueError:
         return None
-    if not u.hostname or not u.port:
+    if not u.hostname:
         return None
     host = re.sub(r"[^0-9A-Za-z]+", "_", u.hostname).strip("_")
-    return f"HERMES_CUSTOM_{host}_{u.port}_API_KEY".upper()
+    # Providers that use the default port (https://api.foo.com/v1) have no
+    # u.port, and Hermes names their key without one.
+    if u.port:
+        return f"HERMES_CUSTOM_{host}_{u.port}_API_KEY".upper()
+    return f"HERMES_CUSTOM_{host}_API_KEY".upper()
 
 
 def creds(base=None, key_env=None):
@@ -208,7 +212,8 @@ def parse_routing():
         return {}
     out, cur = {}, None
     for raw in open(ROUTING, encoding="utf-8"):
-        line = raw.split("#", 1)[0].rstrip()
+        # Only " #" starts a comment: model ids may contain a bare '#'.
+        line = re.split(r"(^|\s)#", raw, 1)[0].rstrip()
         if not line.strip():
             continue
         if not line.startswith(" ") and line.rstrip().endswith(":"):
@@ -275,7 +280,8 @@ def run_with_fallback(models, prompt, race=1, **kw):
     n = max(1, min(int(race or 1), len(models) or 1))
     if n > 1 and len(models) > 1:
         head, rest = models[:n], models[n:]
-        with ThreadPoolExecutor(max_workers=n) as ex:
+        ex = ThreadPoolExecutor(max_workers=n)
+        try:
             futs = {ex.submit(attempt, m): m for m in head}
             for fut in as_completed(futs):
                 try:
@@ -287,9 +293,11 @@ def run_with_fallback(models, prompt, race=1, **kw):
                               "error": r.get("error")})
                 if r.get("ok"):
                     r["tried"] = tried
-                    for f in futs:
-                        f.cancel()
                     return r
+        finally:
+            # A `with` block would join every loser: a winner arriving in 1s
+            # would still wait out a 240s timeout on the other candidate.
+            ex.shutdown(wait=False, cancel_futures=True)
         models = rest
     last = None
     for m in models:
@@ -390,11 +398,21 @@ def health_snapshot(models, parallel=8, timeout=60, force=False):
             if set(models) <= covered:
                 return _health, True
     alive, dead, unknown = probe_models(models, parallel=parallel, timeout=timeout)
+    unknown_names = {u["model"] for u in unknown}
     with _health_lock:
         prev_alive = set(_health["alive"] or []) - set(models)
-        prev_dead = [d for d in (_health["dead"] or []) if d["model"] not in models]
-        _health.update({"alive": sorted(prev_alive | set(alive)),
-                        "dead": prev_dead + dead,
+        # A model that came back unknown was not re-verified: keep whatever
+        # verdict it already had instead of dropping it from both buckets.
+        prev_dead = [d for d in (_health["dead"] or [])
+                     if d["model"] not in models or d["model"] in unknown_names]
+        kept_unknown_dead = [{"model": m, "error": "unknown (cached dead)"}
+                             for m in unknown_names
+                             if m not in {d["model"] for d in dead}
+                             and m in {d["model"] for d in (_health["dead"] or [])}]
+        _health.update({"alive": sorted(prev_alive | set(alive) | (
+                            {m for m in models if m in unknown_names}
+                            - {d["model"] for d in prev_dead + kept_unknown_dead})),
+                        "dead": prev_dead + dead + kept_unknown_dead,
                         "ts": time.time(), "source": "live"})
         health = os.path.join(HOME, "agent-fanout", "health.json")
         os.makedirs(os.path.dirname(health), exist_ok=True)
@@ -809,10 +827,26 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
         v = job.get("isolate")
         return bool(v) if v is not None else bool(isolate)
 
-    def _resolve_in(worktree, path):
-        if not path or not worktree:
+    def _resolve_in(worktree, path, repo_root=""):
+        """Resolve a relative path for a job.
+
+        An isolated job runs in a fresh worktree, but the file it was told to
+        read may be uncommitted in the real repo. Try the worktree first, then
+        the repo root, and only then give up.
+        """
+        if not path:
             return path
-        return path if os.path.isabs(path) else os.path.join(worktree, path)
+        if os.path.isabs(path):
+            return path
+        if worktree:
+            cand = os.path.join(worktree, path)
+            if os.path.exists(cand):
+                return cand
+        if repo_root:
+            cand = os.path.join(repo_root, path)
+            if os.path.exists(cand):
+                return cand
+        return os.path.join(worktree, path) if worktree else path
 
     isolated_jobs = [j for j in jobs if wants_isolate(j)]
     if isolated_jobs and not git_ok:
@@ -902,10 +936,10 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
             src = rec.get("out")
             if not src or not os.path.isfile(src):
                 continue
-            root = rec.get("repo") or ""
-            rel = os.path.basename(src)
-            if root and src.startswith(root + os.sep):
-                rel = os.path.relpath(src, root)
+            # The ancestor's `out` may be relative ("src/x.py"); copying by
+            # basename would land it at the worktree root and the dependent
+            # job would then import the wrong path.
+            rel = rec.get("rel") or os.path.basename(src)
             dst = os.path.join(worktree, rel)
             try:
                 os.makedirs(os.path.dirname(dst) or worktree, exist_ok=True)
@@ -938,14 +972,15 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
         base = job.get("prompt", "")
         if job.get("prompt_file"):
             try:
-                base = open(_resolve_in(worktree, job["prompt_file"]),
+                base = open(_resolve_in(worktree, job["prompt_file"],
+                                        job.get("_repo") or repo),
                             encoding="utf-8").read()
             except OSError as e:
                 return {"id": jid, "ok": False, "error": f"prompt_file: {e}",
                         "branch": job.get("_branch")}
         extra = ""
         for f in job.get("files") or []:
-            fp = _resolve_in(worktree, f)
+            fp = _resolve_in(worktree, f, job.get("_repo") or repo)
             try:
                 extra += ("\n\n--- FILE: %s ---\n" % fp) + open(
                     fp, encoding="utf-8", errors="replace").read()
@@ -981,7 +1016,6 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
                 break
             text = r.get("text") or ""
             rec["chars"] = len(text)
-            rec["_text"] = text
             if not text.strip():
                 rec["error"] = "empty body"
                 break
@@ -1002,6 +1036,7 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
             if ver.get("ok"):
                 rec["ok"] = True
                 rec["error"] = None
+                rec["_text"] = text
                 break
             rec["error"] = "verify failed: %s" % ver.get("cmd")
             if attempt < max(retries, 0):
@@ -1051,8 +1086,10 @@ def _plan_impl(jobs_json: str, parallel: int = 4, preflight: bool = True,
             text = rec.pop("_text", "")
             job_repo = next((p[0].get("_repo") or "" for p in prepared
                              if p[0]["id"] == rec["id"]), "")
+            src_job = next((p[0] for p in prepared if p[0]["id"] == rec["id"]), {})
             ctx[rec["id"]] = {"out": rec.get("out"), "text": text,
-                              "repo": job_repo}
+                              "repo": job_repo,
+                              "rel": str(src_job.get("out") or "")}
             results.append(rec)
 
     order = {jid: i for i, jid in enumerate(ids)}
@@ -1343,6 +1380,12 @@ def git_ensure_repo(path, base_branch="main"):
         return {"ok": False, "error": f"cannot create {path}: {e}"}
     rc, _, _ = _git(["rev-parse", "--is-inside-work-tree"], path)
     created = False
+    if rc == 0:
+        # `path` may be a subdirectory of a repo; worktrees and branches belong
+        # to the root, and reporting the subdirectory mislabels the repo.
+        rc_top, top, _ = _git(["rev-parse", "--show-toplevel"], path)
+        if rc_top == 0 and top.strip():
+            path = top.strip()
     if rc != 0:
         rc, _, err = _git(["init", "-q", "-b", base_branch], path)
         if rc != 0:
@@ -1383,8 +1426,14 @@ def git_worktree_add(repo, path, branch, base_ref):
         rc, _, err = _git(["worktree", "add", "-q", path, base_ref], repo)
         if rc != 0:
             return {"ok": False, "error": err or "worktree add failed"}
+        # `-b` failed (the branch exists). Reuse it instead of leaving a
+        # detached HEAD, which agent_merge cannot resolve as a branch.
+        rc_b, _, _ = _git(["checkout", "-q", "-B", branch], path)
         rc, br, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], path)
-        branch = br or branch
+        branch = (br or "").strip() or branch
+        if not rc_b == 0 and branch == "HEAD":
+            return {"ok": False,
+                    "error": "worktree %s has a detached HEAD" % path}
     return {"ok": True, "worktree": path, "branch": branch}
 
 
